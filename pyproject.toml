@@ -1,0 +1,29 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "swiftness-mcp"
+version = "0.1.0"
+description = "Read-only MCP server for Swiftness (Israeli pension clearing house) data"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [{ name = "Uri Harduf" }]
+dependencies = [
+  "mcp>=1.6.0",
+  "requests>=2.32.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0.0"]
+
+[project.scripts]
+swiftness-mcp = "swiftness_mcp.server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/swiftness_mcp"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
