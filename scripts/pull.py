@@ -10,7 +10,7 @@ import logging
 import sys
 from pathlib import Path
 
-from swiftness_mcp.client import SwiftnessError, load_credentials, pull_savings
+from swiftness_mcp.client import SwiftnessError, SwiftnessOtpRequired, load_credentials, pull_savings
 
 
 def _snapshot_to_dict(s) -> dict:
@@ -23,7 +23,11 @@ def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--pretty", action="store_true")
     p.add_argument("--user", help="only pull this user label")
-    p.add_argument("--otp", help="pre-provided OTP code")
+    p.add_argument(
+        "--otp",
+        required=True,
+        help="6-digit OTP from the Swiftness email (read via your mail client)",
+    )
     p.add_argument("--xml-out", type=Path, help="write consolidated portfolio XML")
     p.add_argument("--cred-path", type=Path, help="alternate credentials path")
     p.add_argument("-v", "--verbose", action="store_true")
@@ -47,8 +51,8 @@ def main() -> int:
             sys.stderr.write(f"swiftness: no user with label {args.user!r}\n")
             return 2
 
-    if args.otp and len(users) > 1:
-        sys.stderr.write("swiftness: --otp requires a single --user\n")
+    if len(users) > 1:
+        sys.stderr.write("swiftness: --otp requires a single --user when multiple configured\n")
         return 2
 
     fetch_xml = args.xml_out is not None
@@ -60,16 +64,11 @@ def main() -> int:
                 id_number=u["id_number"],
                 email=u["email"],
                 otp=args.otp,
-                gmail_token_path=Path(
-                    u.get("gmail_token_path")
-                    or str(Path.home() / ".config" / "gmail-mcp" / "credentials.json")
-                ),
-                gmail_oauth_path=Path(
-                    u.get("gmail_oauth_path")
-                    or str(Path.home() / ".config" / "gmail-mcp" / "gcp-oauth.keys.json")
-                ),
                 fetch_xml=fetch_xml,
             )
+        except SwiftnessOtpRequired as e:
+            sys.stderr.write(f"swiftness: {e}\n")
+            return 2
         except Exception as e:
             results.append({"user_label": u.get("label"), "error": str(e)})
             continue

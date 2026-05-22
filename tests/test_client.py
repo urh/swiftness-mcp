@@ -405,49 +405,25 @@ def test_load_credentials_accepts_valid_file(tmp_path: Path):
     assert cfg["users"][0]["label"] == "primary"
 
 
-# ============================== gmail otp =====================================
+# ============================== OTP helpers ===================================
 
 
-def test_fetch_otp_picks_most_recent_code(monkeypatch):
-    """If two OTP emails arrive (Swiftness's known bug), we take the
-    one with the larger internalDate."""
-    monkeypatch.setattr(
-        swiftness, "_refresh_gmail_access_token", lambda **kw: "fake-token"
-    )
-    monkeypatch.setattr(
-        swiftness,
-        "_gmail_search_otp_messages",
-        lambda *a, **kw: [{"id": "older"}, {"id": "newer"}],
-    )
-
-    def fake_get(token, message_id, **kw):
-        if message_id == "older":
-            return ("הסיסמא החד-פעמית הינה: 111111", 1700000000000)
-        return ("הסיסמא החד-פעמית הינה: 222222", 1700000060000)
-
-    monkeypatch.setattr(swiftness, "_gmail_get_message_text", fake_get)
-    monkeypatch.setattr(swiftness.time, "sleep", lambda *a, **kw: None)
-    monkeypatch.setattr(swiftness.time, "time", _seq_time(start=0.0, step=1.0, until_after=120))
-    otp = swiftness.fetch_otp_from_gmail(
-        after_epoch=1700000000,
-        poll_interval_s=0.0,
-        total_timeout_s=60.0,
-        settle_s=5.0,
-    )
-    assert otp == "222222"
+def test_extract_otp_from_text():
+    assert swiftness.extract_otp_from_text("הסיסמא החד-פעמית הינה: 745934") == "745934"
+    assert swiftness.extract_otp_from_text("no code here") is None
 
 
-def _seq_time(start: float, step: float, until_after: int):
-    """Return a callable that emulates time.time() ticking forward."""
-    state = {"t": start, "n": 0}
+def test_otp_email_search_hints():
+    hints = swiftness.otp_email_search_hints(requested_after_unix=1700000000)
+    assert "from:doNotReply@swiftness.co.il" in hints[0]
+    assert "after:1700000000" in hints[1]
 
-    def now():
-        state["n"] += 1
-        # First call (the one stored in `started`) returns start; later
-        # calls advance by `step` each time.
-        if state["n"] == 1:
-            return state["t"]
-        state["t"] += step
-        return state["t"]
 
-    return now
+def test_pull_savings_requires_otp(monkeypatch):
+    c = swiftness.SwiftnessReadOnlyClient()
+    with pytest.raises(swiftness.SwiftnessOtpRequired):
+        swiftness.pull_savings(
+            user_label="primary",
+            id_number="123456789",
+            email="you@example.com",
+        )

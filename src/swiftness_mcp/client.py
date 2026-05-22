@@ -8,7 +8,7 @@ companies. This module reads those aggregated results.
 Auth flow (reverse-engineered from the browser HAR):
 
 1. ``POST /api/auth/createOtp``      – ask Swiftness to email a 6-digit
-   OTP to the registered address (Gmail). Annoyingly, they sometimes send
+   OTP to the registered address. Annoyingly, they sometimes send
    the OTP twice in two separate emails 20-30s apart. Always take the
    most recent one - the codes can differ.
 2. ``POST /api/auth/loginwithotp``   – exchange ID number + OTP for a
@@ -37,22 +37,20 @@ is *capable* of issuing:
   new path to an allowlist - which is meant to surface obviously in
   code review, and to fail the security tests.
 
-The module also ships a small Gmail helper (``fetch_otp_from_gmail``)
-that can read the OTP email programmatically when Gmail OAuth tokens
-are configured. It speaks plain HTTPS via ``requests``.
+OTP delivery is email-based and provider-agnostic. This module triggers
+the Swiftness OTP email and accepts the 6-digit code from the caller
+(e.g. an AI agent that read it via a separate email MCP). It never
+holds Gmail or other mailbox credentials.
 """
 
 from __future__ import annotations
 
-import base64
 import json
 import logging
 import os
 import re
 import time
 from dataclasses import dataclass, field, replace
-from email import message_from_bytes
-from email.policy import default as default_email_policy
 from pathlib import Path
 from typing import Any
 
@@ -64,20 +62,12 @@ DEFAULT_CRED_PATH = Path(
         str(Path.home() / ".config" / "swiftness" / "credentials.json"),
     )
 )
-DEFAULT_GMAIL_TOKEN_PATH = Path(
-    os.environ.get(
-        "SWIFTNESS_GMAIL_TOKEN_PATH",
-        str(Path.home() / ".config" / "gmail-mcp" / "credentials.json"),
-    )
-)
-DEFAULT_GMAIL_OAUTH_KEYS_PATH = Path(
-    os.environ.get(
-        "SWIFTNESS_GMAIL_OAUTH_PATH",
-        str(Path.home() / ".config" / "gmail-mcp" / "gcp-oauth.keys.json"),
-    )
-)
-
 PORTAL_API = "https://portalapi.swiftness.co.il/api"
+
+# Swiftness sends OTP from this address. Exposed so agents can search any
+# mailbox (Gmail MCP, Outlook, IMAP, etc.) without this module touching email.
+OTP_EMAIL_FROM = "doNotReply@swiftness.co.il"
+OTP_REGEX = re.compile(r"\b(\d{6})\b")
 
 # Auth flow (POSTs that aren't strictly "reads" but are required to
 # authenticate). Listed separately for documentation; the security tests
@@ -131,8 +121,8 @@ class SwiftnessSecurityError(SwiftnessError):
     serious bug."""
 
 
-class SwiftnessOtpTimeout(SwiftnessError):
-    """No OTP email arrived within the polling window."""
+class SwiftnessOtpRequired(SwiftnessError):
+    """Caller must supply an OTP (after reading it from email elsewhere)."""
 
 
 # ---------------------------------------------------------- data classes
@@ -205,183 +195,53 @@ class SavingsSnapshot:
     xml: str | None = None         # only set if get_document_xml() was called
 
 
-# ============================================================ Gmail OTP fetcher
-#
-# Reuses the OAuth refresh_token saved by the gmail-personal MCP. The
-# MCP stores it in Node's preferred shape - access_token, refresh_token,
-# scope, token_type, expiry_date (ms). To use Google's REST API directly
-# we just need refresh_token + client_id/client_secret to mint a fresh
-# access_token. No google-api-python-client dependency required.
+# ============================================================ OTP helpers
 
 
-_OTP_EMAIL_FROM = "doNotReply@swiftness.co.il"
-_OTP_REGEX = re.compile(r"\b(\d{6})\b")
+def extract_otp_from_text(text: str) -> str | None:
+    """Pull a 6-digit Swiftness OTP out of an email body (any provider)."""
+    m = OTP_REGEX.search(text)
+    return m.group(1) if m else None
 
 
-def _refresh_gmail_access_token(
+def otp_email_search_hints(*, requested_after_unix: int | None = None) -> list[str]:
+    """Example search queries an agent can run in Gmail/Outlook/etc."""
+    hints = [f"from:{OTP_EMAIL_FROM}"]
+    if requested_after_unix is not None:
+        hints.append(f"from:{OTP_EMAIL_FROM} after:{requested_after_unix}")
+    return hints
+
+
+def trigger_otp(
+    id_number: str,
+    email: str,
     *,
-    token_path: Path = DEFAULT_GMAIL_TOKEN_PATH,
-    oauth_keys_path: Path = DEFAULT_GMAIL_OAUTH_KEYS_PATH,
-    timeout: float = 15.0,
-) -> str:
-    """Mint a fresh Gmail access_token from the stored refresh_token.
+    timeout: float = 30.0,
+) -> int:
+    """Ask Swiftness to email a one-time code. Returns Unix epoch (seconds)."""
+    client = SwiftnessReadOnlyClient(timeout=timeout)
+    before = int(time.time())
+    client.request_otp(id_number, email)
+    return before
 
-    The refresh_token survives until revoked in the Google account,
-    so this works unattended. Access token lifetime is ~1h.
-    """
-    creds = json.loads(token_path.read_text(encoding="utf-8"))
-    keys = json.loads(oauth_keys_path.read_text(encoding="utf-8"))
-    client = keys.get("installed") or keys.get("web") or keys
-    refresh_token = creds.get("refresh_token")
-    client_id = client.get("client_id")
-    client_secret = client.get("client_secret")
-    if not (refresh_token and client_id and client_secret):
+
+def authenticate(
+    client: SwiftnessReadOnlyClient,
+    *,
+    id_number: str,
+    email: str,
+    otp: str,
+    user_label: str = "",
+) -> None:
+    """Exchange OTP for a JWT and bootstrap the desktop session key."""
+    client.login_with_otp(id_number, otp, email)
+    desktop = client.get_desktop_items()
+    if not client.swiftness_key:
+        who = user_label or id_number
         raise SwiftnessError(
-            f"gmail oauth files at {token_path} / {oauth_keys_path} are missing "
-            "refresh_token / client_id / client_secret"
+            f"getDesktopItems for {who} returned no swiftnessKey: "
+            f"keys={list(desktop)}"
         )
-    r = requests.post(
-        "https://oauth2.googleapis.com/token",
-        data={
-            "client_id": client_id,
-            "client_secret": client_secret,
-            "refresh_token": refresh_token,
-            "grant_type": "refresh_token",
-        },
-        timeout=timeout,
-    )
-    if r.status_code != 200:
-        raise SwiftnessError(
-            f"gmail token refresh failed {r.status_code}: {r.text[:200]}"
-        )
-    body = r.json()
-    tok = body.get("access_token")
-    if not tok:
-        raise SwiftnessError(f"gmail token refresh: no access_token in {body}")
-    return tok
-
-
-def _gmail_search_otp_messages(
-    access_token: str,
-    *,
-    after_epoch: int,
-    timeout: float = 15.0,
-) -> list[dict]:
-    """Return Gmail messages from doNotReply@swiftness.co.il newer than
-    ``after_epoch`` (Unix seconds). Uses Gmail's `q` syntax."""
-    q = f"from:{_OTP_EMAIL_FROM} after:{after_epoch}"
-    r = requests.get(
-        "https://gmail.googleapis.com/gmail/v1/users/me/messages",
-        params={"q": q, "maxResults": 5},
-        headers={"Authorization": f"Bearer {access_token}"},
-        timeout=timeout,
-    )
-    if r.status_code != 200:
-        raise SwiftnessError(f"gmail list failed {r.status_code}: {r.text[:200]}")
-    return r.json().get("messages", []) or []
-
-
-def _gmail_get_message_text(
-    access_token: str, message_id: str, *, timeout: float = 15.0
-) -> tuple[str, int]:
-    """Return (decoded_text_body, internalDate_ms) for a message id.
-
-    Walks the MIME tree, prefers ``text/plain``, falls back to ``text/html``
-    with tags stripped to a flat string.
-    """
-    r = requests.get(
-        f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{message_id}",
-        params={"format": "raw"},
-        headers={"Authorization": f"Bearer {access_token}"},
-        timeout=timeout,
-    )
-    if r.status_code != 200:
-        raise SwiftnessError(f"gmail get failed {r.status_code}: {r.text[:200]}")
-    body = r.json()
-    raw_b64url = body.get("raw") or ""
-    raw = base64.urlsafe_b64decode(raw_b64url + "==")
-    msg = message_from_bytes(raw, policy=default_email_policy)
-    text = ""
-    for part in msg.walk():
-        ctype = part.get_content_type()
-        if ctype == "text/plain":
-            text = part.get_content() or ""
-            break
-    if not text:
-        for part in msg.walk():
-            if part.get_content_type() == "text/html":
-                html = part.get_content() or ""
-                # crude tag strip - good enough to find a 6-digit code
-                text = re.sub(r"<[^>]+>", " ", html)
-                break
-    internal_ms = int(body.get("internalDate", "0") or 0)
-    return text, internal_ms
-
-
-def fetch_otp_from_gmail(
-    *,
-    after_epoch: int,
-    token_path: Path = DEFAULT_GMAIL_TOKEN_PATH,
-    oauth_keys_path: Path = DEFAULT_GMAIL_OAUTH_KEYS_PATH,
-    poll_interval_s: float = 5.0,
-    total_timeout_s: float = 90.0,
-    settle_s: float = 25.0,
-) -> str:
-    """Wait for an OTP email from Swiftness (sent after ``after_epoch``)
-    and return the 6-digit code from the *most recent* matching email.
-
-    - ``settle_s``: Swiftness sometimes emails twice 20-30s apart with a
-      different OTP each time; we wait this long after the first match
-      before reading, to make sure we grab the latest.
-    - ``total_timeout_s``: hard ceiling - raise if no email arrives.
-    """
-    access_token = _refresh_gmail_access_token(
-        token_path=token_path, oauth_keys_path=oauth_keys_path
-    )
-    started = time.time()
-    first_seen_at: float | None = None
-    while time.time() - started < total_timeout_s:
-        msgs = _gmail_search_otp_messages(access_token, after_epoch=after_epoch)
-        if msgs:
-            if first_seen_at is None:
-                first_seen_at = time.time()
-                log.info(
-                    "swiftness OTP: first email seen, settling %.0fs for duplicate",
-                    settle_s,
-                )
-            # Once we've seen at least one, wait `settle_s` past the first
-            # sighting before reading - then take the most recent.
-            if time.time() - first_seen_at >= settle_s:
-                break
-        time.sleep(poll_interval_s)
-    else:
-        raise SwiftnessOtpTimeout(
-            f"no OTP email from {_OTP_EMAIL_FROM} arrived within "
-            f"{total_timeout_s:.0f}s after request"
-        )
-
-    # Final fetch - get the most recent matching email.
-    msgs = _gmail_search_otp_messages(access_token, after_epoch=after_epoch)
-    if not msgs:
-        raise SwiftnessOtpTimeout("OTP email vanished between sightings")
-    decoded: list[tuple[int, str]] = []
-    for m in msgs:
-        try:
-            text, internal_ms = _gmail_get_message_text(access_token, m["id"])
-        except Exception as e:
-            log.warning("gmail decode failed for %s: %s", m.get("id"), e)
-            continue
-        decoded.append((internal_ms, text))
-    if not decoded:
-        raise SwiftnessOtpTimeout("OTP emails arrived but none could be decoded")
-    decoded.sort(key=lambda t: t[0], reverse=True)
-    for _, body in decoded:
-        m = _OTP_REGEX.search(body)
-        if m:
-            return m.group(1)
-    raise SwiftnessOtpTimeout(
-        "OTP email arrived but did not contain a 6-digit code"
-    )
 
 
 # ============================================================ Swiftness client
@@ -834,15 +694,10 @@ def load_credentials(path: Path | None = None) -> dict:
             {
               "label": "primary",
               "id_number": "123456789",
-              "email": "you@example.com",
-              "gmail_token_path": "~/.config/gmail-mcp/credentials.json",
-              "gmail_oauth_path": "~/.config/gmail-mcp/gcp-oauth.keys.json"
+              "email": "you@example.com"
             }
           ]
         }
-
-    ``gmail_token_path`` / ``gmail_oauth_path`` may be omitted - they
-    default to the paths above. Omit them if you pass ``otp`` manually.
     """
     p = path or DEFAULT_CRED_PATH
     cfg = json.loads(p.read_text(encoding="utf-8"))
@@ -863,45 +718,53 @@ def pull_savings(
     id_number: str,
     email: str,
     otp: str | None = None,
-    gmail_token_path: Path = DEFAULT_GMAIL_TOKEN_PATH,
-    gmail_oauth_path: Path = DEFAULT_GMAIL_OAUTH_KEYS_PATH,
+    client: SwiftnessReadOnlyClient | None = None,
     fetch_xml: bool = False,
     timeout: float = 30.0,
 ) -> SavingsSnapshot:
     """End-to-end pull for one user.
 
-    If ``otp`` is provided we skip the email loop. Otherwise we trigger
-    a fresh OTP email and pull the code from Gmail using the saved
-    OAuth refresh_token.
+    Pass ``otp`` to authenticate (or an already-authenticated ``client``).
+    This module does not read email; the caller supplies the OTP after
+    fetching it via their own email integration.
     """
     from datetime import datetime, timezone
 
-    client = SwiftnessReadOnlyClient(timeout=timeout)
-
-    # Step 1: trigger OTP (unless caller already has one).
-    if otp is None:
-        before = int(time.time())
-        client.request_otp(id_number, email)
-        log.info("swiftness OTP requested for %s; waiting on Gmail", user_label)
-        otp = fetch_otp_from_gmail(
-            after_epoch=before,
-            token_path=gmail_token_path,
-            oauth_keys_path=gmail_oauth_path,
+    if client is None:
+        if not otp:
+            raise SwiftnessOtpRequired(
+                f"OTP required for {user_label!r}. Call request_otp first, "
+                "read the 6-digit code from your email (from "
+                f"{OTP_EMAIL_FROM}), then retry with otp=..."
+            )
+        client = SwiftnessReadOnlyClient(timeout=timeout)
+        authenticate(
+            client,
+            id_number=id_number,
+            email=email,
+            otp=otp,
+            user_label=user_label,
         )
-        log.info("swiftness OTP fetched for %s: %s***", user_label, otp[:3])
+    elif not client.swiftness_key:
+        raise SwiftnessError("provided client is not authenticated")
 
-    # Step 2: login.
-    client.login_with_otp(id_number, otp, email)
+    return _pull_savings_with_client(
+        client,
+        user_label=user_label,
+        id_number=id_number,
+        fetch_xml=fetch_xml,
+    )
 
-    # Step 3: bootstrap session (sets swiftness_key).
-    desktop = client.get_desktop_items()
-    if not client.swiftness_key:
-        raise SwiftnessError(
-            f"getDesktopItems for {user_label} returned no swiftnessKey: "
-            f"keys={list(desktop)}"
-        )
 
-    # Step 4: data.
+def _pull_savings_with_client(
+    client: SwiftnessReadOnlyClient,
+    *,
+    user_label: str,
+    id_number: str,
+    fetch_xml: bool,
+) -> SavingsSnapshot:
+    from datetime import datetime, timezone
+
     sc_body = client.get_saving_concentrations()
     rows = parse_saving_concentrations(sc_body)
     policies = parse_saving_products(sc_body)

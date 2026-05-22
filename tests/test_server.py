@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import replace
-from unittest.mock import MagicMock
 
 import pytest
 
@@ -24,13 +23,16 @@ def test_tool_names():
         "get_policies",
         "get_saving_concentrations",
         "get_savings_summary",
+        "request_otp",
+        "submit_otp",
     ]
 
 
 def test_tool_descriptions_advertise_read_only():
     tools = _run(swiftness_mcp.list_tools())
     for t in tools:
-        assert "READ-ONLY" in t.description.upper()
+        if t.name.startswith("get_"):
+            assert "READ-ONLY" in t.description.upper()
 
 
 @pytest.fixture
@@ -90,8 +92,10 @@ def stub_pull(monkeypatch):
         ],
     )
 
-    def fake_pull(user_cfg, *, otp, fetch_xml):
-        return replace(snap, user_label=user_cfg.get("label", "primary"))
+    def fake_pull(user_cfg, *, otp, fetch_xml, auto_request_otp=True):
+        if otp or swiftness_mcp._session_client(user_cfg.get("label", "primary")):
+            return replace(snap, user_label=user_cfg.get("label", "primary"))
+        return None
 
     monkeypatch.setattr(swiftness_mcp, "_pull_for_user", fake_pull)
     return snap
@@ -101,6 +105,31 @@ def test_get_savings_summary(fake_creds, stub_pull):
     out = _run(swiftness_mcp.call_tool("get_savings_summary", {"otp": "123456"}))
     payload = json.loads(out[0].text.split("```json")[1].split("```")[0])
     assert payload["users"][0]["grand_total_ils"] == 1_600_000.0
+
+
+def test_get_savings_summary_otp_required(fake_creds, stub_pull, monkeypatch):
+    monkeypatch.setattr(swiftness_mcp, "trigger_otp", lambda *a, **kw: 1700000000)
+    out = _run(swiftness_mcp.call_tool("get_savings_summary", {}))
+    assert "otp_required" in out[0].text
+
+
+def test_request_otp(fake_creds, monkeypatch):
+    monkeypatch.setattr(swiftness_mcp, "trigger_otp", lambda *a, **kw: 1700000000)
+    out = _run(swiftness_mcp.call_tool("request_otp", {"user_label": "primary"}))
+    assert "otp_sent" in out[0].text
+    assert "doNotReply@swiftness.co.il" in out[0].text
+
+
+def test_submit_otp(fake_creds, monkeypatch):
+    monkeypatch.setattr(
+        swiftness_mcp,
+        "_authenticate_user",
+        lambda user, otp: None,
+    )
+    out = _run(swiftness_mcp.call_tool(
+        "submit_otp", {"user_label": "primary", "otp": "123456"}
+    ))
+    assert "authenticated" in out[0].text
 
 
 def test_get_saving_concentrations(fake_creds, stub_pull):

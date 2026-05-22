@@ -20,11 +20,26 @@ The server is **read-only**: it authenticates and reads aggregated data. It cann
 
 | Tool | Description |
 |------|-------------|
+| `request_otp` | Ask Swiftness to email a one-time login code |
+| `submit_otp` | Complete login with the 6-digit code (caches session ~25 min) |
 | `get_savings_summary` | Bucketed totals (pension, gemel, keren hishtalmut, life insurance) |
 | `get_saving_concentrations` | Per-product-type breakdown with retirement forecasts |
 | `get_policies` | Individual policies with manufacturer, fees, and yields |
 
-All tools accept optional `user_label` and `otp`. If `otp` is omitted, the server triggers email OTP and can read it automatically from Gmail when OAuth tokens are configured.
+Data tools accept optional `otp`. If omitted and no cached session exists, they trigger an OTP email and return `otp_required` instructions for the agent.
+
+## Agent-driven OTP (no mailbox credentials here)
+
+Swiftness sends a 6-digit code by email from `doNotReply@swiftness.co.il`. **This MCP never reads your inbox** — the calling agent should use a separate email MCP (Gmail, Outlook, etc.).
+
+Typical flow:
+
+1. **Swiftness MCP** — `request_otp(user_label="primary")` (or call a data tool, which auto-requests on first use)
+2. **Email MCP** — search for the code, e.g. Gmail: `from:doNotReply@swiftness.co.il`
+3. **Swiftness MCP** — `submit_otp(user_label="primary", otp="123456")` *or* `get_savings_summary(..., otp="123456")`
+4. Further data calls reuse the cached session until it expires (~25 minutes)
+
+Swiftness sometimes sends **two** OTP emails 20–30 seconds apart with different codes; always use the **newest** message.
 
 ## Setup
 
@@ -38,27 +53,7 @@ chmod 600 ~/.config/swiftness/credentials.json
 
 Each user entry needs a national ID number and the email registered with Swiftness.
 
-### 2. Gmail OTP (optional)
-
-For unattended pulls, configure Gmail OAuth token paths (same tokens used by the Gmail MCP server work):
-
-```json
-{
-  "users": [
-    {
-      "label": "primary",
-      "id_number": "123456789",
-      "email": "you@example.com",
-      "gmail_token_path": "~/.config/gmail-mcp/credentials.json",
-      "gmail_oauth_path": "~/.config/gmail-mcp/gcp-oauth.keys.json"
-    }
-  ]
-}
-```
-
-Alternatively, pass a 6-digit `otp` argument if you triggered authentication manually on the Swiftness website.
-
-### 3. Install
+### 2. Install
 
 ```bash
 python -m venv .venv
@@ -66,7 +61,7 @@ source .venv/bin/activate
 pip install -e ".[dev]"
 ```
 
-### 4. MCP configuration
+### 3. MCP configuration
 
 ```json
 {
@@ -82,22 +77,23 @@ pip install -e ".[dev]"
 }
 ```
 
+Pair with your email MCP in the same agent (e.g. `gmail-personal`, `gmail-work`, or any provider).
+
 ## CLI
 
+The CLI requires an OTP on the command line (read it from your mail client first):
+
 ```bash
-python scripts/pull.py
 python scripts/pull.py --user primary --otp 123456
-python scripts/pull.py --xml-out /tmp/portfolio.xml
+python scripts/pull.py --user primary --otp 123456 --xml-out /tmp/portfolio.xml
 ```
 
 ## Authentication flow
 
 1. Request OTP email from Swiftness (`createOtp`)
-2. Read the 6-digit code from email (manual or Gmail helper)
+2. Agent reads the 6-digit code via its **own** email integration
 3. Exchange OTP for a short-lived JWT (`loginwithotp`)
 4. Fetch desktop session key and savings data
-
-Swiftness sometimes sends two OTP emails; the client waits and uses the most recent code.
 
 ## Development
 
